@@ -14,4 +14,7 @@ router.post(
     bookingController.makePayment
 );
 
+
+
+
 module.exports = router; 
