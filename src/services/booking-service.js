@@ -2,30 +2,32 @@ const axios = require("axios");
 const {StatusCodes} = require("http-status-codes")
 const AppError = require("../utils/errors/app-error");
 const { bookingRepository } = require("../repositories");
-const {serverConfig} = require("../config");
+const {serverConfig,queue} = require("../config");
 const db = require("../models");
 const {enums} = require('../utils/common');
 const { BOOKED, CANCELLED } = enums.BOOKING_STATUS;
+const bookingRepo = new bookingRepository();
 
 
 async function createBooking(data) {
   const transaction = await db.sequelize.transaction();
    try {
-        const flight = await axios.get(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
+        const flight = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
         const flightData = flight.data.data;
-        if(data.noofSeats > flightData.totalSeats) {
+        if(data.noOfSeats > flightData.totalSeats) {
             throw new AppError('Not enough seats available', StatusCodes.BAD_REQUEST);
         }
-        const totalBillingAmount = data.noofSeats * flightData.price;
+        const totalBillingAmount = data.noOfSeats * flightData.price;
         const bookingPayload = {...data, totalCost: totalBillingAmount};
-        const booking = await bookingRepository.create(bookingPayload, transaction);
+        const booking = await bookingRepo.create(bookingPayload, transaction);
 
-        await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`, {
-            seats: data.noofSeats
+        await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`, {
+            seats: data.noOfSeats
 });
     
       
      await transaction.commit();
+
         return booking;
     } catch(error) {
         await transaction.rollback();
@@ -38,7 +40,7 @@ async function createBooking(data) {
 async function makePayment(data) {
     const transaction = await db.sequelize.transaction();
     try {
-        const bookingDetails = await bookingRepository.get(data.bookingId, transaction);
+        const bookingDetails = await bookingRepo.get(data.bookingId, transaction);
         if(bookingDetails.status == CANCELLED) {
             throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
         }
@@ -56,8 +58,17 @@ async function makePayment(data) {
             throw new AppError('The user corresponding to the booking doesnt match', StatusCodes.BAD_REQUEST);
         }
         // we assume here that payment is successful
-         await bookingRepository.update(data.bookingId, {status: BOOKED}, transaction);
+         await bookingRepo.update(data.bookingId, {status: BOOKED}, transaction);
+      
+        
+      queue.sendData({
+        text: `Booking successfully done for the flight ${data.bookingId} `,
+        subject: "Booking Confirmation",
+        recepientEmail: "khushi.gupta28.dev@gmail.com"
+     })
+
         await transaction.commit();
+
     } catch(error) {
         await transaction.rollback();
         throw error;
@@ -67,17 +78,17 @@ async function makePayment(data) {
 async function cancelBooking(bookingId) {
     const transaction = await db.sequelize.transaction();
     try {
-        const bookingDetails = await bookingRepository.get(bookingId, transaction);
+        const bookingDetails = await bookingRepo.get(bookingId, transaction);
         console.log(bookingDetails);
         if(bookingDetails.status == CANCELLED) {
             await transaction.commit();
             return true;
         }
-        await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`, {
-            seats: bookingDetails.noofSeats,
+        await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`, {
+            seats: bookingDetails.noOfSeats,
             dec: 0
         });
-        await bookingRepository.update(bookingId, {status: CANCELLED}, transaction);
+        await bookingRepo.update(bookingId, {status: CANCELLED}, transaction);
         await transaction.commit();
 
     } catch(error) {
@@ -90,7 +101,7 @@ async function cancelOldBookings() {
     try {
         console.log("Inside service")
         const time = new Date( Date.now() - 1000 * 300 ); // time 5 mins ago
-        const response = await bookingRepository.cancelOldBookings(time);
+        const response = await bookingRepo.cancelOldBookings(time);
         
         return response;
     } catch(error) {
