@@ -16,48 +16,47 @@ class bookingRepository extends CrudRepository {
         return response;
     } 
 
-     async get(data, transaction) {
-        const response = await Booking.findByPk(data, {transaction: transaction});
+     async get(data, transaction, lock = false) {
+        const response = await Booking.findByPk(data, {
+            transaction,
+            ...(transaction && lock ? { lock: transaction.LOCK.UPDATE } : {}),
+        });
         if(!response) {
             throw new AppError('Not able to find the resource', StatusCodes.NOT_FOUND);
         }
         return response;
     }
 
+    async getForCustomer(userId) {
+        return Booking.findAll({
+            where: { userId },
+            order: [['createdAt', 'DESC']],
+        });
+    }
+
+    async getAllForAdmin() {
+        return Booking.findAll({ order: [['createdAt', 'DESC']] });
+    }
+
     async update(id, data, transaction) { // data -> {col: value, ....}
         const response = await Booking.update(data, {
             where: {
                 id: id
-            }
-        }, {transaction: transaction});
+            },
+            transaction,
+        });
         return response;
     }
 
-    async cancelOldBookings(timestamp) {
-        console.log("in repo")
-        const response = await Booking.update({status: CANCELLED},{
+    async getExpiredBookings(timestamp) {
+        return Booking.findAll({
             where: {
-                [Op.and]: [
-                    {
-                        createdAt: {
-                            [Op.lt]: timestamp
-                        }
-                    }, 
-                    {
-                        status: {
-                            [Op.ne]: BOOKED
-                        }
-                    },
-                    {
-                        status: {
-                            [Op.ne]: CANCELLED
-                        }
-                    }
-                ]
-                
-            }
+                createdAt: { [Op.lt]: timestamp },
+                status: { [Op.notIn]: [BOOKED, CANCELLED] },
+            },
+            attributes: ['id'],
+            order: [['createdAt', 'ASC']],
         });
-        return response;
     }
 }
 

@@ -40,6 +40,10 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 1
+    },
+    passengerDetails: {
+      type: DataTypes.JSON,
+      allowNull: true
     }
   }, {
     sequelize,
