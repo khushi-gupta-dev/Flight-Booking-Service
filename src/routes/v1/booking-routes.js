@@ -23,12 +23,4 @@ router.post(
     bookingController.verifyRazorpayPayment
 );
 
-router.post(
-    '/payments',
-    bookingController.makePayment
-);
-
-
-
-
 module.exports = router; 

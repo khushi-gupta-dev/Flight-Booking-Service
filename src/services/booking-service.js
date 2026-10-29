@@ -86,58 +86,6 @@ async function completeSeatHold(bookingId) {
     }
   }
   
-async function makePayment(data) {
-    const transaction = await db.sequelize.transaction();
-    try {
-        const bookingDetails = await bookingRepo.get(data.bookingId, transaction, true);
-        if(bookingDetails.userId != data.userId) {
-            throw new AppError('The user corresponding to the booking doesnt match', StatusCodes.BAD_REQUEST);
-        }
-        if(bookingDetails.totalCost != data.totalCost) {
-            throw new AppError('The amount of the payment doesnt match', StatusCodes.BAD_REQUEST);
-        }
-        if (bookingDetails.status === BOOKED) {
-            await transaction.commit();
-            return true;
-        }
-        if(bookingDetails.status == CANCELLED) {
-            throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
-        }
-        if (bookingDetails.status !== INITIATED) {
-            throw new AppError('This booking is not awaiting payment.', StatusCodes.CONFLICT);
-        }
-        const bookingTime = new Date(bookingDetails.createdAt);
-        const currentTime = new Date();
-        if(currentTime - bookingTime > 300000) {
-            await transaction.rollback();
-            await cancelBooking(data.bookingId);
-            throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
-        }
-        // we assume here that payment is successful
-         await bookingRepo.update(data.bookingId, {status: BOOKED}, transaction);
-        await transaction.commit();
-
-        const primaryPassenger = bookingDetails.passengerDetails?.[0];
-        if (primaryPassenger?.email) {
-            const passengerNames = bookingDetails.passengerDetails.map((passenger) => passenger.fullName).join(", ");
-            try {
-                await queue.sendData({
-                    text: `Your SkyLink booking ${bookingDetails.id} is confirmed. Flight: ${bookingDetails.flightId}. Passengers: ${passengerNames}. Total: ${bookingDetails.totalCost}.`,
-                    subject: `Booking ${bookingDetails.id} confirmed`,
-                    recepientEmail: primaryPassenger.email
-                });
-            } catch (notificationError) {
-                console.error("Could not queue booking confirmation email", notificationError);
-            }
-        }
-        return true;
-
-    } catch(error) {
-        if (!transaction.finished) await transaction.rollback();
-        throw error;
-    }
-}
-
 function paymentSignatureMatches(orderId, paymentId, signature) {
     if (typeof signature !== 'string' || !/^[a-f0-9]{64}$/i.test(signature)) return false;
     const expected = crypto.createHmac('sha256', serverConfig.RAZORPAY_KEY_SECRET)
@@ -546,7 +494,6 @@ async function cancelOldBookings() {
 
 module.exports = {
   createBooking,
-  makePayment,
   createRazorpayOrder,
   verifyRazorpayPayment,
   processRazorpayWebhook,

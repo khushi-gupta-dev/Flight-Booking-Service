@@ -1,6 +1,5 @@
 const { bookingService } = require("../services");
 const { StatusCodes } = require("http-status-codes");
-const inMemDb = new Map();
 
 function authenticatedUserId(req, res) {
   const userId = Number(req.headers['x-user-id']);
@@ -120,45 +119,6 @@ async function createBooking(req, res) {
   }
 }
 
-async function makePayment(req, res) {
-  try {
-      
-     const idempotencyKey = req.headers['x-idempotency-key'];
-        if(!idempotencyKey ) {
-            return res
-                .status(StatusCodes.BAD_REQUEST)
-                .json({message: 'idempotency key missing'});
-        }
-        const request = {
-            totalCost: req.body.totalCost,
-            userId: Number(req.headers['x-user-id']),
-            bookingId: Number(req.body.bookingId),
-        };
-        const priorPayment = inMemDb.get(idempotencyKey);
-        if (priorPayment && (priorPayment.bookingId !== request.bookingId || priorPayment.userId !== request.userId || priorPayment.totalCost !== request.totalCost)) {
-            return res.status(StatusCodes.CONFLICT).json({ success: false, message: 'This idempotency key was already used for a different payment request.' });
-        }
-        if(priorPayment) {
-            return res
-                .status(StatusCodes.OK)
-                .json({ success: true, message: 'Payment already processed.', data: priorPayment.response, error: {} });
-    } 
-    
-        const response = await bookingService.makePayment(request);
-    
-     inMemDb.set(idempotencyKey, { ...request, response });
-    
-        return res.status(StatusCodes.OK).json({
-            success: true,
-            message: 'Payment completed.',
-            data: response,
-            error: {},
-        });
-    } catch (error) {
-       return sendError(res, error);
-    }
-}
-
 async function createPaymentOrder(req, res) {
   const userId = authenticatedUserId(req, res);
   if (!userId) return;
@@ -227,7 +187,6 @@ module.exports = {
   getCustomerBooking,
   cancelCustomerBooking,
   createBooking,
-  makePayment,
   createPaymentOrder,
   verifyRazorpayPayment,
   receiveRazorpayWebhook,
