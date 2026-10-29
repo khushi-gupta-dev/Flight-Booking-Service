@@ -9,10 +9,13 @@ const express = require("express");
 
 const { serverConfig, logger , queue } = require("./config");
 const apiRoutes = require("./routes");
+const { bookingController } = require("./controllers");
 const CRON = require('./utils/common/cron-jobs');
 
 const axios = require("axios");
 const app = express();
+
+app.post('/webhooks/razorpay', express.raw({ type: 'application/json', limit: '1mb' }), bookingController.receiveRazorpayWebhook);
 
 app.use(express.json());
 

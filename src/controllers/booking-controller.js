@@ -208,6 +208,19 @@ async function verifyRazorpayPayment(req, res) {
   }
 }
 
+async function receiveRazorpayWebhook(req, res) {
+  try {
+    const result = await bookingService.processRazorpayWebhook({
+      rawBody: req.body,
+      signature: req.get('x-razorpay-signature'),
+      eventId: req.get('x-razorpay-event-id'),
+    });
+    return res.status(StatusCodes.OK).json({ success: true, message: 'Webhook accepted.', data: result });
+  } catch (error) {
+    return sendError(res, error);
+  }
+}
+
 module.exports = {
   getCustomerBookings,
   getAllBookings,
@@ -217,4 +230,5 @@ module.exports = {
   makePayment,
   createPaymentOrder,
   verifyRazorpayPayment,
+  receiveRazorpayWebhook,
 };

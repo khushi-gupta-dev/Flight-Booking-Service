@@ -3,7 +3,7 @@ const crypto = require("crypto");
 const {StatusCodes} = require("http-status-codes")
 const AppError = require("../utils/errors/app-error");
 const { bookingRepository } = require("../repositories");
-const {serverConfig,queue} = require("../config");
+const {serverConfig,queue,logger} = require("../config");
 const db = require("../models");
 const {enums} = require('../utils/common');
 const { BOOKED, CANCELLED, INITIATED } = enums.BOOKING_STATUS;
@@ -166,7 +166,7 @@ async function verifyRazorpayPayment({ bookingId, userId, orderId, paymentId, si
             lock: transaction.LOCK.UPDATE,
         });
         if (!attempt) throw new AppError('Payment order does not belong to this booking.', StatusCodes.BAD_REQUEST);
-        if (attempt.providerPaymentId && attempt.providerPaymentId !== paymentId) {
+        if (['captured', 'late_capture'].includes(attempt.status) && attempt.providerPaymentId !== paymentId) {
             throw new AppError('This payment attempt is already associated with a different payment.', StatusCodes.CONFLICT);
         }
         if (!paymentSignatureMatches(attempt.providerOrderId, paymentId, signature)) {
@@ -194,12 +194,12 @@ async function verifyRazorpayPayment({ bookingId, userId, orderId, paymentId, si
         }
 
         if (payment.status === 'authorized') {
-            await attempt.update({ status: 'authorized', providerPaymentId: payment.id }, { transaction });
+            await attempt.update({ status: 'authorized' }, { transaction });
             await transaction.commit();
             return { status: 'authorized', bookingId: booking.id };
         }
         if (payment.status === 'failed') {
-            await attempt.update({ status: 'failed', providerPaymentId: payment.id }, { transaction });
+            await attempt.update({ status: 'failed' }, { transaction });
             await transaction.commit();
             return { status: 'failed', bookingId: booking.id };
         }
@@ -241,6 +241,125 @@ async function verifyRazorpayPayment({ bookingId, userId, orderId, paymentId, si
     return { status: 'captured', bookingId: booking.id };
 }
 
+function webhookSignatureMatches(rawBody, signature) {
+    if (!Buffer.isBuffer(rawBody) || typeof signature !== 'string' || !/^[a-f0-9]{64}$/i.test(signature)) return false;
+    const expected = crypto.createHmac('sha256', serverConfig.RAZORPAY_WEBHOOK_SECRET).update(rawBody).digest();
+    const supplied = Buffer.from(signature, 'hex');
+    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+async function processRazorpayWebhook({ rawBody, signature, eventId }) {
+    if (!serverConfig.RAZORPAY_WEBHOOK_SECRET) {
+        throw new AppError('Razorpay webhook secret is not configured in Booking Service.', StatusCodes.SERVICE_UNAVAILABLE);
+    }
+    if (!webhookSignatureMatches(rawBody, signature)) {
+        throw new AppError('Razorpay webhook signature is invalid.', StatusCodes.BAD_REQUEST);
+    }
+
+    let event;
+    try {
+        event = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+        throw new AppError('Razorpay webhook body is not valid JSON.', StatusCodes.BAD_REQUEST);
+    }
+    if (typeof eventId !== 'string' || !/^evt_[a-zA-Z0-9]+$/.test(eventId)) {
+        throw new AppError('Razorpay webhook event ID is invalid.', StatusCodes.BAD_REQUEST);
+    }
+
+    const transaction = await db.sequelize.transaction();
+    let booking;
+    let notify = false;
+    try {
+        const priorEvent = await db.PaymentWebhookEvent.findOne({ where: { eventId }, transaction });
+        if (priorEvent) {
+            await transaction.commit();
+            return { duplicate: true, status: priorEvent.status };
+        }
+
+        const supportedEvent = ['payment.captured', 'payment.failed'].includes(event.event);
+        const payment = event.payload?.payment?.entity;
+        let eventStatus = 'ignored';
+
+        if (supportedEvent) {
+            if (!payment?.id || !payment?.order_id) {
+                throw new AppError('Razorpay payment webhook is missing its payment or order ID.', StatusCodes.BAD_REQUEST);
+            }
+            const attemptReference = await PaymentAttempt.findOne({ where: { providerOrderId: payment.order_id }, transaction });
+            if (!attemptReference) {
+                throw new AppError('No local payment attempt matches this Razorpay order.', StatusCodes.NOT_FOUND);
+            }
+            booking = await bookingRepo.get(attemptReference.bookingId, transaction, true);
+            const attempt = await PaymentAttempt.findByPk(attemptReference.id, { transaction, lock: transaction.LOCK.UPDATE });
+
+            if (Number(payment.amount) !== Number(attempt.amount) || payment.currency !== attempt.currency) {
+                throw new AppError('Razorpay webhook payment does not match the saved amount or currency.', StatusCodes.CONFLICT);
+            }
+
+            if (event.event === 'payment.failed') {
+                if (!['captured', 'late_capture'].includes(attempt.status)) {
+                    await attempt.update({ status: 'failed' }, { transaction });
+                }
+                eventStatus = 'processed';
+            } else if (payment.status !== 'captured') {
+                throw new AppError('Razorpay captured event does not contain a captured payment.', StatusCodes.CONFLICT);
+            } else if (attempt.providerPaymentId && attempt.providerPaymentId !== payment.id) {
+                // Preserve the first captured payment identity; reconcile any extra captured payment separately.
+                eventStatus = 'ignored';
+                logger.warn(`Additional captured payment received for booking ${booking.id}; payment ${payment.id} requires reconciliation.`);
+            } else if (attempt.status === 'captured' && booking.status === BOOKED) {
+                eventStatus = 'processed';
+            } else if (attempt.status === 'late_capture') {
+                eventStatus = 'processed';
+            } else {
+                const holdExpired = Date.now() - new Date(booking.createdAt).getTime() > 300000;
+                if (booking.status === INITIATED && !holdExpired) {
+                    await attempt.update({ status: 'captured', providerPaymentId: payment.id }, { transaction });
+                    await bookingRepo.update(booking.id, { status: BOOKED }, transaction);
+                    notify = true;
+                    eventStatus = 'processed';
+                } else {
+                    await attempt.update({ status: 'late_capture', providerPaymentId: payment.id }, { transaction });
+                    eventStatus = 'processed';
+                }
+            }
+        }
+
+        await db.PaymentWebhookEvent.create({
+            eventId,
+            eventType: event.event || 'unknown',
+            providerPaymentId: payment?.id || null,
+            providerOrderId: payment?.order_id || null,
+            status: eventStatus,
+        }, { transaction });
+        await transaction.commit();
+    } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        if (error.name === 'SequelizeUniqueConstraintError') {
+            const duplicate = await db.PaymentWebhookEvent.findOne({ where: { eventId } });
+            if (duplicate) return { duplicate: true, status: duplicate.status };
+        }
+        if (error instanceof AppError) throw error;
+        throw new AppError('Could not process Razorpay webhook. It can be retried.', StatusCodes.INTERNAL_SERVER_ERROR);
+    }
+
+    if (notify && booking) {
+        const primaryPassenger = booking.passengerDetails?.[0];
+        if (primaryPassenger?.email) {
+            const passengerNames = booking.passengerDetails.map(({ fullName }) => fullName).join(', ');
+            try {
+                await queue.sendData({
+                    text: `Your SkyLink booking ${booking.id} is confirmed. Flight: ${booking.flightId}. Passengers: ${passengerNames}. Total: ${booking.totalCost}.`,
+                    subject: `Booking ${booking.id} confirmed`,
+                    recepientEmail: primaryPassenger.email,
+                });
+            } catch (notificationError) {
+                logger.error(`Could not queue booking confirmation email: ${notificationError.message}`);
+            }
+        }
+    }
+    return { duplicate: false, status: 'processed' };
+}
+
 async function createRazorpayOrder({ bookingId, userId, idempotencyKey }) {
     if (!serverConfig.RAZORPAY_KEY_ID || !serverConfig.RAZORPAY_KEY_SECRET) {
         throw new AppError('Razorpay API credentials are not configured in Booking Service.', StatusCodes.SERVICE_UNAVAILABLE);
@@ -279,7 +398,7 @@ async function createRazorpayOrder({ bookingId, userId, idempotencyKey }) {
         }
 
         const activeAttempt = await PaymentAttempt.findOne({
-            where: { bookingId, status: ['creating', 'created'] },
+            where: { bookingId, status: ['creating', 'created', 'authorized'] },
             transaction,
         });
         if (activeAttempt) {
@@ -293,7 +412,9 @@ async function createRazorpayOrder({ bookingId, userId, idempotencyKey }) {
                     keyId: serverConfig.RAZORPAY_KEY_ID,
                 };
             }
-            throw new AppError('A payment order is already being created for this booking. Retry shortly.', StatusCodes.CONFLICT);
+            throw new AppError(activeAttempt.status === 'authorized'
+                ? 'Payment authorization is still being processed. Wait for its final status before retrying.'
+                : 'A payment order is already being created for this booking. Retry shortly.', StatusCodes.CONFLICT);
         }
 
         if (!Number.isSafeInteger(Number(booking.totalCost)) || Number(booking.totalCost) < 1) {
@@ -428,6 +549,7 @@ module.exports = {
   makePayment,
   createRazorpayOrder,
   verifyRazorpayPayment,
+  processRazorpayWebhook,
   getCustomerBookings,
   getAllBookings,
   getCustomerBooking,
