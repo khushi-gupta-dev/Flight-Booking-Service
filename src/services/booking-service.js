@@ -9,6 +9,7 @@ const {enums} = require('../utils/common');
 const { BOOKED, CANCELLED, INITIATED } = enums.BOOKING_STATUS;
 const bookingRepo = new bookingRepository();
 const PaymentAttempt = db.PaymentAttempt;
+const RefundAttempt = db.RefundAttempt;
 
 function assertSameBookingRequest(existing, data) {
   const sameRequest = Number(existing.userId) === Number(data.userId)
@@ -159,9 +160,10 @@ async function verifyRazorpayPayment({ bookingId, userId, orderId, paymentId, si
         const holdExpired = Date.now() - new Date(booking.createdAt).getTime() > 300000;
         if (booking.status !== INITIATED || holdExpired) {
             await attempt.update({ status: 'late_capture', providerPaymentId: payment.id }, { transaction });
+            await getOrCreateRefundAttempt({ bookingId: booking.id, paymentAttemptId: attempt.id, reason: 'late_capture', transaction });
             await transaction.commit();
             if (booking.status === INITIATED && holdExpired) await cancelBooking(booking.id, true);
-            return { status: 'late_capture', bookingId: booking.id };
+            return { status: 'late_capture', bookingId: booking.id, refundStatus: 'queued' };
         }
 
         await attempt.update({ status: 'captured', providerPaymentId: payment.id }, { transaction });
@@ -196,6 +198,141 @@ function webhookSignatureMatches(rawBody, signature) {
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
+async function getOrCreateRefundAttempt({ bookingId, paymentAttemptId, reason, transaction }) {
+    const paymentAttempt = await PaymentAttempt.findOne({
+        where: { id: paymentAttemptId, bookingId },
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+    });
+    if (!paymentAttempt || !['captured', 'late_capture'].includes(paymentAttempt.status) || !paymentAttempt.providerPaymentId) {
+        throw new AppError('A captured Razorpay payment is required before refunding.', StatusCodes.CONFLICT);
+    }
+
+    const latest = await RefundAttempt.findOne({
+        where: { paymentAttemptId },
+        order: [['attemptNumber', 'DESC']],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+    });
+    if (latest && latest.status !== 'failed') return latest;
+
+    const attemptNumber = (latest?.attemptNumber || 0) + 1;
+    return RefundAttempt.create({
+        bookingId,
+        paymentAttemptId,
+        amount: paymentAttempt.amount,
+        currency: paymentAttempt.currency,
+        reason,
+        status: 'queued',
+        idempotencyKey: `skylink_refund_${paymentAttemptId}_${attemptNumber}`,
+        receipt: `skylink-r-${paymentAttemptId}-${attemptNumber}`,
+        attemptNumber,
+    }, { transaction });
+}
+
+async function ensureRefundAttempt(input) {
+    const transaction = await db.sequelize.transaction();
+    try {
+        const refundAttempt = await getOrCreateRefundAttempt({ ...input, transaction });
+        await transaction.commit();
+        return refundAttempt;
+    } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        throw error;
+    }
+}
+
+const refundStatusPriority = { queued: 0, pending: 1, failed: 2, processed: 3 };
+
+async function saveRefundStatus(refundAttemptId, status, providerRefundId = null) {
+    const transaction = await db.sequelize.transaction();
+    try {
+        const refundAttempt = await RefundAttempt.findByPk(refundAttemptId, {
+            transaction,
+            lock: transaction.LOCK.UPDATE,
+        });
+        if (refundStatusPriority[status] >= refundStatusPriority[refundAttempt.status]) {
+            await refundAttempt.update({
+                status,
+                ...(providerRefundId ? { providerRefundId } : {}),
+            }, { transaction });
+        }
+        await transaction.commit();
+        return refundAttempt;
+    } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        throw error;
+    }
+}
+
+async function requestRazorpayRefund(refundAttempt) {
+    if (['pending', 'processed'].includes(refundAttempt.status)) return refundAttempt;
+    if (!serverConfig.RAZORPAY_KEY_ID || !serverConfig.RAZORPAY_KEY_SECRET) {
+        throw new AppError('Razorpay API credentials are not configured in Booking Service.', StatusCodes.SERVICE_UNAVAILABLE);
+    }
+    const paymentAttempt = await PaymentAttempt.findByPk(refundAttempt.paymentAttemptId);
+    if (!paymentAttempt?.providerPaymentId) {
+        throw new AppError('The captured Razorpay payment ID is unavailable for refund.', StatusCodes.CONFLICT);
+    }
+
+    try {
+        const response = await axios.post(
+            `https://api.razorpay.com/v1/payments/${paymentAttempt.providerPaymentId}/refund`,
+            {
+                amount: refundAttempt.amount,
+                receipt: refundAttempt.receipt,
+                notes: { bookingId: String(refundAttempt.bookingId), refundAttemptId: String(refundAttempt.id) },
+            },
+            {
+                auth: { username: serverConfig.RAZORPAY_KEY_ID, password: serverConfig.RAZORPAY_KEY_SECRET },
+                headers: { 'X-Refund-Idempotency': refundAttempt.idempotencyKey },
+                timeout: 10000,
+            },
+        );
+        const refund = response.data;
+        if (refund.payment_id !== paymentAttempt.providerPaymentId
+            || Number(refund.amount) !== Number(refundAttempt.amount)
+            || refund.currency !== refundAttempt.currency) {
+            throw new AppError('Razorpay refund does not match the saved payment amount or currency.', StatusCodes.CONFLICT);
+        }
+        const status = ['pending', 'processed', 'failed'].includes(refund.status) ? refund.status : 'pending';
+        return saveRefundStatus(refundAttempt.id, status, refund.id);
+    } catch (error) {
+        if (error.response?.status === 409) {
+            return saveRefundStatus(refundAttempt.id, 'pending');
+        }
+        if (error.response && error.response.status >= 400 && error.response.status < 500) {
+            await saveRefundStatus(refundAttempt.id, 'failed');
+            if (error instanceof AppError) throw error;
+            throw new AppError('Razorpay rejected the refund request. Review the refund status before retrying.', StatusCodes.BAD_GATEWAY);
+        }
+        if (error instanceof AppError) throw error;
+        throw new AppError('Razorpay refund status is uncertain. Retry the same cancellation to safely check it.', StatusCodes.BAD_GATEWAY);
+    }
+}
+
+async function processQueuedRefundAttempts() {
+    const queued = await RefundAttempt.findAll({
+        where: { status: 'queued' },
+        order: [['createdAt', 'ASC']],
+        limit: 25,
+    });
+    let processed = 0;
+    for (const refundAttempt of queued) {
+        try {
+            const updated = await requestRazorpayRefund(refundAttempt);
+            if (refundAttempt.reason === 'cancellation' && ['pending', 'processed'].includes(updated.status)) {
+                const booking = await bookingRepo.get(refundAttempt.bookingId);
+                if (booking.status !== CANCELLED) await cancelBooking(booking.id);
+            }
+            processed += 1;
+        } catch (error) {
+            logger.error(`Could not process refund attempt ${refundAttempt.id}: ${error.message}`);
+        }
+    }
+    return { processed, queued: queued.length - processed };
+}
+
 async function processRazorpayWebhook({ rawBody, signature, eventId }) {
     if (!serverConfig.RAZORPAY_WEBHOOK_SECRET) {
         throw new AppError('Razorpay webhook secret is not configured in Booking Service.', StatusCodes.SERVICE_UNAVAILABLE);
@@ -225,7 +362,9 @@ async function processRazorpayWebhook({ rawBody, signature, eventId }) {
         }
 
         const supportedEvent = ['payment.captured', 'payment.failed'].includes(event.event);
+        const supportedRefundEvent = ['refund.created', 'refund.processed', 'refund.failed'].includes(event.event);
         const payment = event.payload?.payment?.entity;
+        const refund = event.payload?.refund?.entity;
         let eventStatus = 'ignored';
 
         if (supportedEvent) {
@@ -267,6 +406,45 @@ async function processRazorpayWebhook({ rawBody, signature, eventId }) {
                     eventStatus = 'processed';
                 } else {
                     await attempt.update({ status: 'late_capture', providerPaymentId: payment.id }, { transaction });
+                    await getOrCreateRefundAttempt({ bookingId: booking.id, paymentAttemptId: attempt.id, reason: 'late_capture', transaction });
+                    eventStatus = 'processed';
+                }
+            }
+        } else if (supportedRefundEvent) {
+            if (!refund?.id || !refund?.payment_id) {
+                throw new AppError('Razorpay refund webhook is missing its refund or payment ID.', StatusCodes.BAD_REQUEST);
+            }
+            const paymentAttempt = await PaymentAttempt.findOne({
+                where: { providerPaymentId: refund.payment_id },
+                transaction,
+                lock: transaction.LOCK.UPDATE,
+            });
+            if (paymentAttempt) {
+                const notedAttemptId = Number(refund.notes?.refundAttemptId);
+                let refundAttempt = Number.isInteger(notedAttemptId)
+                    ? await RefundAttempt.findOne({
+                        where: { id: notedAttemptId, paymentAttemptId: paymentAttempt.id },
+                        transaction,
+                        lock: transaction.LOCK.UPDATE,
+                    })
+                    : null;
+                if (!refundAttempt) {
+                    refundAttempt = await RefundAttempt.findOne({
+                        where: { paymentAttemptId: paymentAttempt.id, providerRefundId: refund.id },
+                        transaction,
+                        lock: transaction.LOCK.UPDATE,
+                    });
+                }
+                if (refundAttempt) {
+                    if (Number(refund.amount) !== Number(refundAttempt.amount) || refund.currency !== refundAttempt.currency) {
+                        throw new AppError('Razorpay refund webhook does not match the saved refund amount or currency.', StatusCodes.CONFLICT);
+                    }
+                    const status = event.event === 'refund.processed' || refund.status === 'processed'
+                        ? 'processed'
+                        : event.event === 'refund.failed' || refund.status === 'failed' ? 'failed' : 'pending';
+                    if (refundStatusPriority[status] >= refundStatusPriority[refundAttempt.status]) {
+                        await refundAttempt.update({ status, providerRefundId: refund.id }, { transaction });
+                    }
                     eventStatus = 'processed';
                 }
             }
@@ -423,6 +601,23 @@ async function withFlightDetails(booking) {
     }
 }
 
+async function withRefundDetails(booking) {
+    const data = await withFlightDetails(booking);
+    const refund = await RefundAttempt.findOne({
+        where: { bookingId: booking.id },
+        order: [['attemptNumber', 'DESC']],
+    });
+    return {
+        ...data,
+        refund: refund ? {
+            status: refund.status,
+            amount: refund.amount,
+            currency: refund.currency,
+            reason: refund.reason,
+        } : null,
+    };
+}
+
 async function getCustomerBookings(userId) {
     const bookings = await bookingRepo.getForCustomer(userId);
     return Promise.all(bookings.map(withFlightDetails));
@@ -437,19 +632,48 @@ async function getCustomerBooking(bookingId, userId) {
     if (Number(booking.userId) !== Number(userId)) {
         throw new AppError('Booking not found', StatusCodes.NOT_FOUND);
     }
-    return withFlightDetails(booking);
+    return withRefundDetails(booking);
 }
 
 async function cancelCustomerBooking(bookingId, userId) {
-    const booking = await getCustomerBooking(bookingId, userId);
-    if (booking.status === CANCELLED) return booking;
-    const flightResponse = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}`);
-    const flight = flightResponse.data.data;
-    if (!flight || !Number.isFinite(Date.parse(flight.departureTime)) || Date.parse(flight.departureTime) <= Date.now()) {
-        throw new AppError('This flight has already departed or its schedule is unavailable.', StatusCodes.CONFLICT);
+    const booking = await bookingRepo.get(bookingId);
+    if (Number(booking.userId) !== Number(userId)) {
+        throw new AppError('Booking not found', StatusCodes.NOT_FOUND);
     }
-    await cancelBooking(booking.id);
-    return withFlightDetails(await bookingRepo.get(booking.id));
+    const paymentAttempt = await PaymentAttempt.findOne({
+        where: { bookingId: booking.id, status: ['captured', 'late_capture'] },
+        order: [['createdAt', 'DESC']],
+    });
+    let latestRefund = null;
+
+    if (booking.status === CANCELLED) {
+        latestRefund = paymentAttempt && await RefundAttempt.findOne({
+            where: { paymentAttemptId: paymentAttempt.id },
+            order: [['attemptNumber', 'DESC']],
+        });
+        if (!paymentAttempt || latestRefund?.status !== 'failed') return withRefundDetails(booking);
+    } else {
+        const flightResponse = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}`);
+        const flight = flightResponse.data.data;
+        if (!flight || !Number.isFinite(Date.parse(flight.departureTime)) || Date.parse(flight.departureTime) <= Date.now()) {
+            throw new AppError('This flight has already departed or its schedule is unavailable.', StatusCodes.CONFLICT);
+        }
+    }
+
+    if (paymentAttempt && [BOOKED, CANCELLED].includes(booking.status)) {
+        const refundAttempt = await ensureRefundAttempt({
+            bookingId: booking.id,
+            paymentAttemptId: paymentAttempt.id,
+            reason: booking.status === CANCELLED ? latestRefund.reason : 'cancellation',
+        });
+        const refund = await requestRazorpayRefund(refundAttempt);
+        if (refund.status === 'failed') {
+            throw new AppError('Razorpay could not complete the refund. The refund status is recorded for retry.', StatusCodes.CONFLICT);
+        }
+    }
+
+    if (booking.status !== CANCELLED) await cancelBooking(booking.id);
+    return withRefundDetails(await bookingRepo.get(booking.id));
 }
 
 async function cancelBooking(bookingId, onlyIfUnpaid = false) {
@@ -501,6 +725,7 @@ module.exports = {
   getAllBookings,
   getCustomerBooking,
   cancelCustomerBooking,
+  processQueuedRefundAttempts,
  
   cancelOldBookings
  
