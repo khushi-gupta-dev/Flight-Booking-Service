@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "dev": "npx nodemon src/index.js"
+    "dev": "npx nodemon -L src/index.js"
   },
   "author": "khushi gupta",
   "license": "ISC",

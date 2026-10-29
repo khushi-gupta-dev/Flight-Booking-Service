@@ -6,7 +6,7 @@ let channel , connection;
 
 async function connectQueue(){
     try{
-         connection = await amqplib.connect("amqp://localhost");
+         connection = await amqplib.connect(process.env.RABBITMQ_URL || "amqp://localhost");
 
          channel = await connection.createChannel();
 
@@ -16,7 +16,9 @@ async function connectQueue(){
 
  
     } catch (error) {
-        console.error( error);
+        channel = undefined;
+        connection = undefined;
+        throw error;
     }
 }
 
