@@ -7,6 +7,7 @@ const db = require("../models");
 const {enums} = require('../utils/common');
 const { BOOKED, CANCELLED, INITIATED } = enums.BOOKING_STATUS;
 const bookingRepo = new bookingRepository();
+const PaymentAttempt = db.PaymentAttempt;
 
 function assertSameBookingRequest(existing, data) {
   const sameRequest = Number(existing.userId) === Number(data.userId)
@@ -136,6 +137,110 @@ async function makePayment(data) {
     }
 }
 
+async function createRazorpayOrder({ bookingId, userId, idempotencyKey }) {
+    if (!serverConfig.RAZORPAY_KEY_ID || !serverConfig.RAZORPAY_KEY_SECRET) {
+        throw new AppError('Razorpay API credentials are not configured in Booking Service.', StatusCodes.SERVICE_UNAVAILABLE);
+    }
+
+    const transaction = await db.sequelize.transaction();
+    let attempt;
+    try {
+        const booking = await bookingRepo.get(bookingId, transaction, true);
+        if (Number(booking.userId) !== Number(userId)) {
+            throw new AppError('Booking not found.', StatusCodes.NOT_FOUND);
+        }
+        if (booking.status !== INITIATED) {
+            throw new AppError('This booking is not awaiting payment.', StatusCodes.CONFLICT);
+        }
+        if (Date.now() - new Date(booking.createdAt).getTime() > 300000) {
+            throw new AppError('The booking hold has expired.', StatusCodes.CONFLICT);
+        }
+
+        const existing = await PaymentAttempt.findOne({ where: { idempotencyKey }, transaction });
+        if (existing) {
+            if (Number(existing.bookingId) !== Number(bookingId) || Number(existing.amount) !== Number(booking.totalCost) * 100) {
+                throw new AppError('This idempotency key was already used for a different payment order.', StatusCodes.CONFLICT);
+            }
+            if (existing.status === 'created' && existing.providerOrderId) {
+                await transaction.commit();
+                return {
+                    paymentAttemptId: existing.id,
+                    razorpayOrderId: existing.providerOrderId,
+                    amount: existing.amount,
+                    currency: existing.currency,
+                    keyId: serverConfig.RAZORPAY_KEY_ID,
+                };
+            }
+            throw new AppError('This payment order attempt is not reusable. Start a new attempt.', StatusCodes.CONFLICT);
+        }
+
+        const activeAttempt = await PaymentAttempt.findOne({
+            where: { bookingId, status: ['creating', 'created'] },
+            transaction,
+        });
+        if (activeAttempt) {
+            if (activeAttempt.status === 'created' && activeAttempt.providerOrderId) {
+                await transaction.commit();
+                return {
+                    paymentAttemptId: activeAttempt.id,
+                    razorpayOrderId: activeAttempt.providerOrderId,
+                    amount: activeAttempt.amount,
+                    currency: activeAttempt.currency,
+                    keyId: serverConfig.RAZORPAY_KEY_ID,
+                };
+            }
+            throw new AppError('A payment order is already being created for this booking. Retry shortly.', StatusCodes.CONFLICT);
+        }
+
+        if (!Number.isSafeInteger(Number(booking.totalCost)) || Number(booking.totalCost) < 1) {
+            throw new AppError('The booking fare is invalid.', StatusCodes.UNPROCESSABLE_ENTITY);
+        }
+        const amount = Number(booking.totalCost) * 100;
+        if (!Number.isSafeInteger(amount)) {
+            throw new AppError('The booking fare is outside the supported payment range.', StatusCodes.UNPROCESSABLE_ENTITY);
+        }
+        const receipt = `skylink-${booking.id}-${Date.now()}`.slice(0, 40);
+        attempt = await PaymentAttempt.create({
+            bookingId: booking.id,
+            amount,
+            currency: serverConfig.RAZORPAY_CURRENCY,
+            status: 'creating',
+            idempotencyKey,
+            receipt,
+        }, { transaction });
+        await transaction.commit();
+    } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        throw error;
+    }
+
+    try {
+        const response = await axios.post('https://api.razorpay.com/v1/orders', {
+            amount: attempt.amount,
+            currency: attempt.currency,
+            receipt: attempt.receipt,
+            notes: { bookingId: String(attempt.bookingId), paymentAttemptId: String(attempt.id) },
+        }, {
+            auth: {
+                username: serverConfig.RAZORPAY_KEY_ID,
+                password: serverConfig.RAZORPAY_KEY_SECRET,
+            },
+            timeout: 10000,
+        });
+        await attempt.update({ providerOrderId: response.data.id, status: 'created' });
+        return {
+            paymentAttemptId: attempt.id,
+            razorpayOrderId: response.data.id,
+            amount: attempt.amount,
+            currency: attempt.currency,
+            keyId: serverConfig.RAZORPAY_KEY_ID,
+        };
+    } catch (error) {
+        await attempt.update({ status: 'failed' });
+        throw new AppError('Razorpay could not create the payment order. Start a new payment attempt or contact support if the result is unclear.', StatusCodes.BAD_GATEWAY);
+    }
+}
+
 async function withFlightDetails(booking) {
     try {
         const response = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}`);
@@ -217,6 +322,7 @@ async function cancelOldBookings() {
 module.exports = {
   createBooking,
   makePayment,
+  createRazorpayOrder,
   getCustomerBookings,
   getAllBookings,
   getCustomerBooking,

@@ -14,6 +14,11 @@ router.post(
 );
 
 router.post(
+    '/payments/order',
+    bookingController.createPaymentOrder
+);
+
+router.post(
     '/payments',
     bookingController.makePayment
 );

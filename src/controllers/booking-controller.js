@@ -158,11 +158,32 @@ async function makePayment(req, res) {
        return sendError(res, error);
     }
 }
+
+async function createPaymentOrder(req, res) {
+  const userId = authenticatedUserId(req, res);
+  if (!userId) return;
+  const bookingId = Number(req.body.bookingId);
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  if (!Number.isInteger(bookingId) || bookingId < 1) {
+    return res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: 'A valid bookingId is required.' });
+  }
+  if (typeof idempotencyKey !== 'string' || !/^[a-zA-Z0-9._:-]{8,120}$/.test(idempotencyKey)) {
+    return res.status(StatusCodes.BAD_REQUEST).json({ success: false, message: 'A valid X-Idempotency-Key header is required.' });
+  }
+  try {
+    const data = await bookingService.createRazorpayOrder({ bookingId, userId, idempotencyKey });
+    return res.status(StatusCodes.CREATED).json({ success: true, message: 'Payment order created.', data });
+  } catch (error) {
+    return sendError(res, error);
+  }
+}
+
 module.exports = {
   getCustomerBookings,
   getAllBookings,
   getCustomerBooking,
   cancelCustomerBooking,
   createBooking,
-  makePayment
+  makePayment,
+  createPaymentOrder,
 };
