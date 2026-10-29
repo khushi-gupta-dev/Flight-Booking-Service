@@ -304,7 +304,16 @@ async function requestRazorpayRefund(refundAttempt) {
         if (error.response && error.response.status >= 400 && error.response.status < 500) {
             await saveRefundStatus(refundAttempt.id, 'failed');
             if (error instanceof AppError) throw error;
-            throw new AppError('Razorpay rejected the refund request. Review the refund status before retrying.', StatusCodes.BAD_GATEWAY);
+            const providerMessage = error.response.data?.error?.description;
+            const safeProviderMessage = typeof providerMessage === 'string'
+                ? providerMessage.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240)
+                : '';
+            throw new AppError(
+                safeProviderMessage
+                    ? `Razorpay rejected the refund request: ${safeProviderMessage}`
+                    : 'Razorpay rejected the refund request. Check the provider payment status before retrying.',
+                StatusCodes.BAD_GATEWAY,
+            );
         }
         if (error instanceof AppError) throw error;
         throw new AppError('Razorpay refund status is uncertain. Retry the same cancellation to safely check it.', StatusCodes.BAD_GATEWAY);

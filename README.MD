@@ -22,7 +22,7 @@ Webhook processing uses `RAZORPAY_WEBHOOK_SECRET`; configure the same Test Mode 
 
 `RefundAttempts` stores full-refund requests separately from payment attempts, including the provider refund ID, amount in paise, reason, idempotency key, and queued/pending/processed/failed state. Apply `20261030150000-create-refund-attempts` before running cancellation or late-capture refunds. Refund creation uses Razorpay's `X-Refund-Idempotency` header; retries reuse the stored key, and a new attempt/key is created after a definitive failure.
 
-Paid cancellation queues a full refund and releases seats after Razorpay accepts the request. A scheduled job retries queued refunds, including late captures, using the same provider idempotency key. Refund status is included in the customer's booking detail; a definitively failed refund can be retried from that booking.
+Paid cancellation queues a full refund and releases seats after Razorpay accepts the request. A scheduled job retries queued refunds, including late captures, using the same provider idempotency key. Refund status is included in the customer's booking detail; a definitively failed refund can be retried while the booking remains booked. For a definitive Razorpay 4xx rejection, the API returns the provider's sanitized description to help diagnose the rejection; verify the payment/refund in Razorpay before retrying.
 
 ## Run
 
