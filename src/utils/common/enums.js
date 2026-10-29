@@ -10,6 +10,7 @@ const BOOKING_STATUS = {
 
     BOOKED: "booked",
     CANCELLED: "cancelled",
+    CANCELLATION_REQUESTED: "cancellation_requested",
     INITIATED: "initiated",
        PENDING: "pending"
 }

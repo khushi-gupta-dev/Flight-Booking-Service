@@ -6,7 +6,7 @@ const { bookingRepository } = require("../repositories");
 const {serverConfig,queue,logger} = require("../config");
 const db = require("../models");
 const {enums} = require('../utils/common');
-const { BOOKED, CANCELLED, INITIATED } = enums.BOOKING_STATUS;
+const { BOOKED, CANCELLED, CANCELLATION_REQUESTED, INITIATED } = enums.BOOKING_STATUS;
 const bookingRepo = new bookingRepository();
 const PaymentAttempt = db.PaymentAttempt;
 const RefundAttempt = db.RefundAttempt;
@@ -220,7 +220,7 @@ async function getOrCreateRefundAttempt({ bookingId, paymentAttemptId, reason, t
     return RefundAttempt.create({
         bookingId,
         paymentAttemptId,
-        amount: paymentAttempt.amount,
+        amount: reason === 'cancellation' ? Math.round(paymentAttempt.amount * 0.85) : paymentAttempt.amount,
         currency: paymentAttempt.currency,
         reason,
         status: 'queued',
@@ -655,25 +655,28 @@ async function cancelCustomerBooking(bookingId, userId) {
     });
     let latestRefund = null;
 
-    if (booking.status === CANCELLED) {
-        latestRefund = paymentAttempt && await RefundAttempt.findOne({
-            where: { paymentAttemptId: paymentAttempt.id },
-            order: [['attemptNumber', 'DESC']],
-        });
-        if (!paymentAttempt || latestRefund?.status !== 'failed') return withRefundDetails(booking);
-    } else {
+    if (booking.status === CANCELLED) return withRefundDetails(booking);
+
+    if (booking.status !== CANCELLATION_REQUESTED) {
         const flightResponse = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}`);
         const flight = flightResponse.data.data;
         if (!flight || !Number.isFinite(Date.parse(flight.departureTime)) || Date.parse(flight.departureTime) <= Date.now()) {
             throw new AppError('This flight has already departed or its schedule is unavailable.', StatusCodes.CONFLICT);
         }
+        if (paymentAttempt && booking.status === BOOKED) {
+            await bookingRepo.update(booking.id, { status: CANCELLATION_REQUESTED });
+        }
     }
 
-    if (paymentAttempt && [BOOKED, CANCELLED].includes(booking.status)) {
+    if (paymentAttempt && [BOOKED, CANCELLATION_REQUESTED].includes(booking.status)) {
+        latestRefund = await RefundAttempt.findOne({
+            where: { paymentAttemptId: paymentAttempt.id },
+            order: [['attemptNumber', 'DESC']],
+        });
         const refundAttempt = await ensureRefundAttempt({
             bookingId: booking.id,
             paymentAttemptId: paymentAttempt.id,
-            reason: booking.status === CANCELLED ? latestRefund.reason : 'cancellation',
+            reason: latestRefund?.reason || 'cancellation',
         });
         const refund = await requestRazorpayRefund(refundAttempt);
         if (refund.status === 'failed') {
