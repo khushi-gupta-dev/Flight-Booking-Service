@@ -19,6 +19,11 @@ router.post(
 );
 
 router.post(
+    '/:id/payments/verify',
+    bookingController.verifyRazorpayPayment
+);
+
+router.post(
     '/payments',
     bookingController.makePayment
 );
