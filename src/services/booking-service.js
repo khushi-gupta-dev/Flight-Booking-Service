@@ -8,8 +8,25 @@ const {enums} = require('../utils/common');
 const { BOOKED, CANCELLED, INITIATED } = enums.BOOKING_STATUS;
 const bookingRepo = new bookingRepository();
 
+function assertSameBookingRequest(existing, data) {
+  const sameRequest = Number(existing.userId) === Number(data.userId)
+    && Number(existing.flightId) === Number(data.flightId)
+    && Number(existing.noOfSeats) === Number(data.noOfSeats)
+    && JSON.stringify(existing.passengerDetails || []) === JSON.stringify(data.passengerDetails || []);
+  if (!sameRequest) {
+    throw new AppError('This idempotency key was already used for a different booking request.', StatusCodes.CONFLICT);
+  }
+  return existing;
+}
 
 async function createBooking(data) {
+  const existing = await bookingRepo.findByIdempotencyKey(data.idempotencyKey);
+  if (existing) {
+    assertSameBookingRequest(existing, data);
+    if (existing.status === CANCELLED) throw new AppError('This booking request has expired or was cancelled.', StatusCodes.CONFLICT);
+    return existing.status === enums.BOOKING_STATUS.PENDING ? completeSeatHold(existing.id) : existing;
+  }
+
   const transaction = await db.sequelize.transaction();
    try {
         const flight = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`);
@@ -21,23 +38,50 @@ async function createBooking(data) {
             throw new AppError('Not enough seats available', StatusCodes.BAD_REQUEST);
         }
         const totalBillingAmount = data.noOfSeats * flightData.price;
-        const bookingPayload = {...data, totalCost: totalBillingAmount};
+        const bookingPayload = {...data, totalCost: totalBillingAmount, status: enums.BOOKING_STATUS.PENDING};
         const booking = await bookingRepo.create(bookingPayload, transaction);
-
-        await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`, {
-            seats: data.noOfSeats
-});
-    
-      
-     await transaction.commit();
-
-        return booking;
+        await transaction.commit();
+        return completeSeatHold(booking.id);
     } catch(error) {
-        await transaction.rollback();
+        if (!transaction.finished) await transaction.rollback();
+        if (error.name === 'SequelizeUniqueConstraintError') {
+            const duplicate = await bookingRepo.findByIdempotencyKey(data.idempotencyKey);
+            if (duplicate) {
+                assertSameBookingRequest(duplicate, data);
+                if (duplicate.status === CANCELLED) throw new AppError('This booking request has expired or was cancelled.', StatusCodes.CONFLICT);
+                return duplicate.status === enums.BOOKING_STATUS.PENDING ? completeSeatHold(duplicate.id) : duplicate;
+            }
+        }
         throw error;
     }
+}
 
+async function completeSeatHold(bookingId) {
+    const transaction = await db.sequelize.transaction();
+    try {
+        const booking = await bookingRepo.get(bookingId, transaction, true);
+        if (booking.status === CANCELLED) throw new AppError('This booking request has expired or was cancelled.', StatusCodes.CONFLICT);
+        if (booking.status !== enums.BOOKING_STATUS.PENDING) {
+            await transaction.commit();
+            return booking;
+        }
+        if (Date.now() - new Date(booking.createdAt).getTime() > 300000) {
+            await transaction.rollback();
+            await cancelBooking(bookingId, true);
+            throw new AppError('The booking hold has expired.', StatusCodes.CONFLICT);
+        }
 
+        await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}/seats`, {
+            seats: booking.noOfSeats,
+            operationId: `booking-hold-${booking.idempotencyKey}`,
+        });
+        await bookingRepo.update(bookingId, { status: INITIATED }, transaction);
+        await transaction.commit();
+        return bookingRepo.get(bookingId);
+    } catch (error) {
+        if (!transaction.finished) await transaction.rollback();
+        throw error;
+    }
   }
   
 async function makePayment(data) {
@@ -120,9 +164,7 @@ async function getCustomerBooking(bookingId, userId) {
 
 async function cancelCustomerBooking(bookingId, userId) {
     const booking = await getCustomerBooking(bookingId, userId);
-    if (booking.status === CANCELLED) {
-        throw new AppError('This booking is already cancelled.', StatusCodes.CONFLICT);
-    }
+    if (booking.status === CANCELLED) return booking;
     const flightResponse = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}`);
     const flight = flightResponse.data.data;
     if (!flight || !Number.isFinite(Date.parse(flight.departureTime)) || Date.parse(flight.departureTime) <= Date.now()) {
@@ -146,7 +188,9 @@ async function cancelBooking(bookingId, onlyIfUnpaid = false) {
         }
         await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`, {
             seats: bookingDetails.noOfSeats,
-            dec: 0
+            dec: 0,
+            operationId: `booking-release-${bookingDetails.id}`,
+            ...(bookingDetails.idempotencyKey ? { compensatesOperationId: `booking-hold-${bookingDetails.idempotencyKey}` } : {}),
         });
         await bookingRepo.update(bookingId, {status: CANCELLED}, transaction);
         await transaction.commit();

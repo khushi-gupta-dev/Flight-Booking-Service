@@ -68,6 +68,13 @@ async function cancelCustomerBooking(req, res) {
 
 async function createBooking(req, res) {
   try {
+    const idempotencyKey = req.headers['x-idempotency-key'];
+    if (typeof idempotencyKey !== 'string' || !/^[a-zA-Z0-9._:-]{8,120}$/.test(idempotencyKey)) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        success: false,
+        message: 'A valid X-Idempotency-Key header is required for booking creation.',
+      });
+    }
     const noOfSeats = Number(req.body.noOfSeats)
     const passengerDetails = req.body.passengerDetails
     if (!Number.isInteger(noOfSeats) || noOfSeats < 1 || !Array.isArray(passengerDetails) || passengerDetails.length !== noOfSeats) {
@@ -99,6 +106,7 @@ async function createBooking(req, res) {
       userId: Number(req.headers['x-user-id']),
       noOfSeats,
       passengerDetails: normalizedPassengers,
+      idempotencyKey,
     });
 
     return res.status(StatusCodes.OK).json({

@@ -22,6 +22,11 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.INTEGER,
       allowNull: false
     },
+    idempotencyKey: {
+      type: DataTypes.STRING(120),
+      allowNull: true,
+      unique: true
+    },
     userId: {
       type: DataTypes.INTEGER,
       allowNull: false

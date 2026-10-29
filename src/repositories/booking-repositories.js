@@ -16,6 +16,10 @@ class bookingRepository extends CrudRepository {
         return response;
     } 
 
+    async findByIdempotencyKey(idempotencyKey, transaction) {
+        return Booking.findOne({ where: { idempotencyKey }, transaction });
+    }
+
      async get(data, transaction, lock = false) {
         const response = await Booking.findByPk(data, {
             transaction,
