@@ -14,6 +14,7 @@ module.exports = (sequelize, DataTypes) => {
     disruptionId: { type: DataTypes.INTEGER, allowNull: false },
     bookingId: { type: DataTypes.INTEGER, allowNull: false },
     userId: { type: DataTypes.INTEGER, allowNull: false },
+    selectedAlternativeId: { type: DataTypes.INTEGER, allowNull: true },
     status: {
       type: DataTypes.ENUM('created', 'awaiting_alternatives', 'awaiting_approval', 'declined', 'rebooking', 'completed', 'failed'),
       allowNull: false,

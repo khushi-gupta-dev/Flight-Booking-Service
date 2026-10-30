@@ -3,7 +3,11 @@
 const { Model } = require('sequelize');
 
 module.exports = (sequelize, DataTypes) => {
-  class RecoveryAlternative extends Model {}
+  class RecoveryAlternative extends Model {
+    static associate(models) {
+      this.belongsTo(models.RecoveryCase, { foreignKey: 'recoveryCaseId', as: 'recoveryCase' });
+    }
+  }
 
   RecoveryAlternative.init({
     recoveryCaseId: { type: DataTypes.INTEGER, allowNull: false },
