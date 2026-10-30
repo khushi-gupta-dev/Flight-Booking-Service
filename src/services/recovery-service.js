@@ -33,6 +33,16 @@ async function getCustomerRecoveryCase(id, userId) {
   return withRecoveryHistory(recoveryCase);
 }
 
+async function getRecoveryCaseForAdmin(id) {
+  const recoveryCase = await db.RecoveryCase.findByPk(id, {
+    include: [
+      { model: db.RecoveryAlternative, as: "alternatives", required: false },
+      { model: db.Booking, as: "booking", required: true },
+    ],
+  });
+  return withRecoveryHistory(recoveryCase);
+}
+
 async function withRecoveryHistory(recoveryCase) {
   const audit = await db.RecoveryAuditEvent.findAll({
     where: { aggregateType: "recovery_case", aggregateId: String(recoveryCase.id) },
@@ -64,7 +74,7 @@ async function markSagaFailure(id, userId, error) {
   });
 }
 
-async function runRebooking({ id, userId }) {
+async function runRebooking({ id, userId, allowAdmin = false }) {
   const transaction = await db.sequelize.transaction();
   let recoveryCase;
   let booking;
@@ -72,7 +82,7 @@ async function runRebooking({ id, userId }) {
   let attempt;
   try {
     recoveryCase = await db.RecoveryCase.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
-    assertCaseOwner(recoveryCase, userId);
+    if (!allowAdmin) assertCaseOwner(recoveryCase, userId);
     booking = await db.Booking.findByPk(recoveryCase.bookingId, { transaction, lock: transaction.LOCK.UPDATE });
     alternative = await db.RecoveryAlternative.findByPk(recoveryCase.selectedAlternativeId, { transaction, lock: transaction.LOCK.UPDATE });
     if (!booking || !alternative) throw new AppError("The selected recovery data is unavailable.", StatusCodes.CONFLICT);
@@ -90,7 +100,7 @@ async function runRebooking({ id, userId }) {
     });
     await transaction.commit();
 
-    if (attempt.status === "completed") return getCustomerRecoveryCase(id, userId);
+    if (attempt.status === "completed") return allowAdmin ? getRecoveryCaseForAdmin(id) : getCustomerRecoveryCase(id, userId);
     if (["created", "failed", "replacement_hold_pending"].includes(attempt.status)) {
       await saveAttempt(id, { status: "replacement_hold_pending", errorMessage: null, lastStep: "replacement_hold" });
       await axios.patch(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${attempt.replacementFlightId}/seats`, {
@@ -139,7 +149,7 @@ async function runRebooking({ id, userId }) {
         payload: { previousFlightId: attempt.previousFlightId },
       });
     }
-    return getCustomerRecoveryCase(id, userId);
+    return allowAdmin ? getRecoveryCaseForAdmin(id) : getCustomerRecoveryCase(id, userId);
   } catch (error) {
     if (transaction && !transaction.finished) await transaction.rollback();
     await markSagaFailure(id, userId, error);
@@ -203,8 +213,19 @@ async function retryRecoveryCase({ id, userId }) {
   if (!["failed", "rebooking"].includes(recoveryCase.status)) {
     throw new AppError("This recovery case is not ready for rebooking retry.", StatusCodes.CONFLICT);
   }
+
   await db.RecoveryCase.update({ status: "rebooking" }, { where: { id } });
   return runRebooking({ id, userId });
+}
+
+async function adminRetryRecoveryCase({ id, adminId }) {
+  const recoveryCase = await db.RecoveryCase.findByPk(id);
+  if (!recoveryCase) throw new AppError("Recovery case not found.", StatusCodes.NOT_FOUND);
+  if (!["failed", "rebooking"].includes(recoveryCase.status)) {
+    throw new AppError("This recovery case is not ready for rebooking retry.", StatusCodes.CONFLICT);
+  }
+  await db.RecoveryCase.update({ status: "rebooking" }, { where: { id } });
+  return runRebooking({ id, userId: adminId, allowAdmin: true });
 }
 
 async function declineRecoveryCase({ id, userId, idempotencyKey }) {
@@ -244,4 +265,4 @@ async function declineRecoveryCase({ id, userId, idempotencyKey }) {
   }
 }
 
-module.exports = { getCustomerRecoveryCases, getCustomerRecoveryCase, approveRecoveryCase, declineRecoveryCase, retryRecoveryCase };
+module.exports = { getCustomerRecoveryCases, getCustomerRecoveryCase, approveRecoveryCase, declineRecoveryCase, retryRecoveryCase, adminRetryRecoveryCase };

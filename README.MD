@@ -45,6 +45,13 @@ event, and moves the case to `rebooking` for Part 5. Declining moves it to
 `declined`; neither action changes seats or the booking until the rebooking
 saga runs. Apply migration `20261030170300-add-recovery-selection`.
 
+Admin recovery operations are available through
+`/bookingService/api/v1/recovery-operations`. The admin dashboard can query
+filtered cases and summary metrics, retry failed cases, assign a future
+replacement flight manually, and apply a reason-required operational override.
+These routes are admin-only at the Gateway and reuse the same rebooking saga
+and inventory operation IDs.
+
 After approval, the rebooking saga uses stable inventory operation IDs. It
 holds all replacement seats first, updates the booking flight, then releases
 the original seats with a compensating release operation. Progress is stored
