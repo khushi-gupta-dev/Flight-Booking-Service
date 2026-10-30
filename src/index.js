@@ -11,6 +11,7 @@ const { serverConfig, logger , queue } = require("./config");
 const apiRoutes = require("./routes");
 const { bookingController } = require("./controllers");
 const CRON = require('./utils/common/cron-jobs');
+const { connectRecoveryConsumer } = require('./services/recovery-event-consumer');
 
 const axios = require("axios");
 const app = express();
@@ -42,6 +43,8 @@ app.listen(serverConfig.PORT, async() => {
   try {
     await queue.connectQueue();
     logger.info("Connected to RabbitMQ queue noti-queue");
+    await connectRecoveryConsumer();
+    logger.info("Connected to RabbitMQ disruption recovery consumer");
   } catch (error) {
     logger.error(`RabbitMQ connection failed: ${error.message}`);
   }

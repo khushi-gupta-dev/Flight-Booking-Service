@@ -14,6 +14,16 @@ Flight Booking Service (default port `4000`) owns passenger booking records, Raz
 
 Booking creation first persists a `pending` booking, then obtains the seat hold while locking that booking row. A failed or timed-out hold stays pending so retrying the same create key resumes the same request. Unpaid holds expire after five minutes; a scheduled job retries expiry releases every minute. Hold and release calls use stable operation IDs, and Flights Service records each inventory adjustment transactionally. Releases reference their hold, so a release arriving before a delayed hold prevents that hold from decrementing inventory later. Booking status changes lock the booking row, so concurrent expiry and cancellation requests cannot release the same seats twice. Cross-service updates remain a saga rather than one atomic database transaction. Verified payment queues email to the first passenger. Apply the `20261029120000-add-booking-idempotency-key` migration before running the updated service.
 
+The Phase 1 recovery consumer listens to the durable `booking-recovery-queue`
+queue on the `skylink.events` RabbitMQ exchange. For each idempotent
+`disruption.created` event, it finds `booked` bookings for the disrupted
+flight, creates one `RecoveryCase` per booking with
+`awaiting_alternatives` status, and appends recovery audit events. Duplicate
+events are acknowledged without creating duplicate cases. Apply migration
+`20261030170100-create-recovery-cases` before starting the consumer. Set
+`RABBITMQ_EVENTS_EXCHANGE` or `RABBITMQ_RECOVERY_QUEUE` only when using
+non-default broker names.
+
 Razorpay order creation uses `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and optional `RAZORPAY_CURRENCY` (defaults to `INR`) from the Booking Service environment. Apply the `20261030120000-create-payment-attempts` migration. The frontend opens Razorpay Checkout using the returned public key ID and server-created order; the secret remains in Booking Service.
 
 Checkout verification stores the provider payment ID and captured/authorized/failed state. Apply `20261030130000-add-payment-verification-fields` after the payment-attempt migration. A captured payment arriving after a booking expires is recorded as `late_capture` and queued for a full refund. The customer page submits Checkout's order/payment/signature response to the verification endpoint before displaying confirmation.
