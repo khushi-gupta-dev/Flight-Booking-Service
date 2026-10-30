@@ -63,4 +63,18 @@ async function decline(req, res) {
   try { return res.json({ success: true, data: await recoveryService.declineRecoveryCase({ id: recoveryId, userId: id, idempotencyKey }) }); } catch (error) { return sendError(res, error); }
 }
 
-module.exports = { list, detail, approve, decline };
+async function retry(req, res) {
+  const id = userId(req, res);
+  const recoveryId = caseId(req, res);
+  if (!id || !recoveryId) return;
+  try {
+    return res.status(StatusCodes.ACCEPTED).json({
+      success: true,
+      data: await recoveryService.retryRecoveryCase({ id: recoveryId, userId: id }),
+    });
+  } catch (error) {
+    return sendError(res, error);
+  }
+}
+
+module.exports = { list, detail, approve, decline, retry };

@@ -6,5 +6,6 @@ router.get("/", controller.list);
 router.get("/:id", controller.detail);
 router.post("/:id/approve", controller.approve);
 router.post("/:id/decline", controller.decline);
+router.post("/:id/retry", controller.retry);
 
 module.exports = router;

@@ -45,6 +45,15 @@ event, and moves the case to `rebooking` for Part 5. Declining moves it to
 `declined`; neither action changes seats or the booking until the rebooking
 saga runs. Apply migration `20261030170300-add-recovery-selection`.
 
+After approval, the rebooking saga uses stable inventory operation IDs. It
+holds all replacement seats first, updates the booking flight, then releases
+the original seats with a compensating release operation. Progress is stored
+in `RebookingAttempts`; a timeout or service failure leaves the last completed
+step available for retry through
+`POST /bookingService/api/v1/recovery-cases/:id/retry`. Apply migration
+`20261030170400-create-rebooking-attempts`. A completed recovery case exposes
+its attempt status and audit timeline to the customer.
+
 Razorpay order creation uses `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and optional `RAZORPAY_CURRENCY` (defaults to `INR`) from the Booking Service environment. Apply the `20261030120000-create-payment-attempts` migration. The frontend opens Razorpay Checkout using the returned public key ID and server-created order; the secret remains in Booking Service.
 
 Checkout verification stores the provider payment ID and captured/authorized/failed state. Apply `20261030130000-add-payment-verification-fields` after the payment-attempt migration. A captured payment arriving after a booking expires is recorded as `late_capture` and queued for a full refund. The customer page submits Checkout's order/payment/signature response to the verification endpoint before displaying confirmation.
