@@ -1,6 +1,6 @@
 # Flight Booking Service
 
-Flight Booking Service (default port `4000`) owns passenger booking records, Razorpay payments, customer cancellation, admin booking review, and expiration of unpaid holds. Routes mount at `/api/v1` and are proxied under `/bookingService` by the gateway.
+Flight Booking Service (default port `4000`) owns passenger booking records, Razorpay payments, customer cancellation, admin booking review, and expiration of unpaid holds. Routes mount at `/api/v1` and are proxied under `/bookingService` by the gateway. The frontend reaches this service only through the gateway; the AI assistant cannot create or modify bookings.
 
 ## Routes
 
@@ -26,4 +26,4 @@ Paid cancellation requests an 85% refund and releases seats after Razorpay accep
 
 ## Run
 
-Configure `PORT`, `FLIGHT_SERVICE`, the booking database, and RabbitMQ. Apply migrations with `npx sequelize db:migrate --config src/config/config.json --migrations-path src/migrations --models-path src/models`, then run `npm run dev`.
+Configure `PORT` (default `4000`), `FLIGHT_SERVICE` (default `http://localhost:3001`), the booking database, and RabbitMQ. Apply migrations with `npx sequelize db:migrate --config src/config/config.json --migrations-path src/migrations --models-path src/models`, then run `npm run dev`. The service must be able to reach Flights Service, RabbitMQ, and Razorpay Test Mode for the complete booking flow.
