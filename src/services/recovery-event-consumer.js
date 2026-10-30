@@ -120,6 +120,7 @@ async function handleDisruptionCreated(event) {
         defaults: {
           userId: booking.userId,
           status: "awaiting_alternatives",
+          expiresAt: new Date(new Date(disruption.effectiveAt).getTime() + Math.max(serverConfig.RECOVERY_SEARCH_WINDOW_HOURS, 1) * 60 * 60 * 1000),
         },
         transaction,
       });

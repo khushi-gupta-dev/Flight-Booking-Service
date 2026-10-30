@@ -44,12 +44,60 @@ async function getRecoveryCaseForAdmin(id) {
 }
 
 async function withRecoveryHistory(recoveryCase) {
-  const audit = await db.RecoveryAuditEvent.findAll({
-    where: { aggregateType: "recovery_case", aggregateId: String(recoveryCase.id) },
-    order: [["createdAt", "ASC"]],
+  const [audit, attempt] = await Promise.all([
+    db.RecoveryAuditEvent.findAll({
+      where: { aggregateType: "recovery_case", aggregateId: String(recoveryCase.id) },
+      order: [["createdAt", "ASC"]],
+    }),
+    db.RebookingAttempt.findOne({ where: { recoveryCaseId: recoveryCase.id } }),
+  ]);
+  const data = recoveryCase.toJSON();
+  const originalFlightId = attempt?.previousFlightId || data.booking?.flightId;
+  const currentFlightId = data.booking?.flightId;
+  const alternativeIds = (data.alternatives || []).map((alternative) => alternative.replacementFlightId);
+  const flightIds = [...new Set([originalFlightId, currentFlightId, ...alternativeIds].filter(Boolean))];
+  const flightResults = await Promise.all(flightIds.map(async (flightId) => {
+    try {
+      const response = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/flights/${flightId}`);
+      return [Number(flightId), response.data.data];
+    } catch {
+      return [Number(flightId), null];
+    }
+  }));
+  let disruption = null;
+  try {
+    const response = await axios.get(`${serverConfig.FLIGHT_SERVICE}/api/v1/disruptions/${data.disruptionId}`);
+    disruption = response.data.data;
+  } catch {
+    disruption = null;
+  }
+  const flights = Object.fromEntries(flightResults);
+  const originalFlight = flights[Number(originalFlightId)] || null;
+  const currentFlight = flights[Number(currentFlightId)] || null;
+  const enrichedAlternatives = (data.alternatives || []).map((alternative) => {
+    const flight = flights[Number(alternative.replacementFlightId)];
+    return {
+      ...alternative,
+      flightNumber: flight?.flightNumber || null,
+      route: flight ? `${flight.departureAirportId} → ${flight.arrivalAirportId}` : null,
+    };
   });
-  const attempt = await db.RebookingAttempt.findOne({ where: { recoveryCaseId: recoveryCase.id } });
-  return { ...recoveryCase.toJSON(), audit, rebookingAttempt: attempt };
+  return {
+    ...data,
+    audit,
+    rebookingAttempt: attempt,
+    recoveryDetails: {
+      originalFlight,
+      currentFlight,
+      disruption,
+      alternatives: enrichedAlternatives,
+      approvalDeadline: data.expiresAt,
+      passengerCount: Number(data.booking?.noOfSeats || 0),
+      previousBookingReference: data.booking?.id ? `BOOK-${data.booking.id}` : null,
+      currentBookingReference: data.booking?.id ? `BOOK-${data.booking.id}` : null,
+      compensation: null,
+    },
+  };
 }
 
 async function saveAttempt(id, data) {
