@@ -24,6 +24,16 @@ events are acknowledged without creating duplicate cases. Apply migration
 `RABBITMQ_EVENTS_EXCHANGE` or `RABBITMQ_RECOVERY_QUEUE` only when using
 non-default broker names.
 
+After detection, the consumer queries Flights Service for future flights on
+the same route with enough seats for the complete booking. It ranks up to five
+results using departure timing, arrival timing, seat availability, and fare,
+then stores a snapshot in `RecoveryAlternatives` with an explanation shown to
+the passenger. Cases with recommendations move to `awaiting_approval`;
+cases without eligible flights move to `failed` and can be regenerated when
+the original event is redelivered. Configure
+`RECOVERY_SEARCH_WINDOW_HOURS` (default `48`) to change the search window.
+Apply migration `20261030170200-create-recovery-alternatives`.
+
 Razorpay order creation uses `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and optional `RAZORPAY_CURRENCY` (defaults to `INR`) from the Booking Service environment. Apply the `20261030120000-create-payment-attempts` migration. The frontend opens Razorpay Checkout using the returned public key ID and server-created order; the secret remains in Booking Service.
 
 Checkout verification stores the provider payment ID and captured/authorized/failed state. Apply `20261030130000-add-payment-verification-fields` after the payment-attempt migration. A captured payment arriving after a booking expires is recorded as `late_capture` and queued for a full refund. The customer page submits Checkout's order/payment/signature response to the verification endpoint before displaying confirmation.
